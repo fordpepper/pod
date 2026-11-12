@@ -4,6 +4,7 @@ import android.Manifest;
 import android.app.Activity;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
+import android.graphics.drawable.ColorDrawable;
 import android.media.AudioManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -24,8 +25,10 @@ public class MainActivity extends Activity {
             lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
             getWindow().setAttributes(lp);
         }
+        getWindow().setBackgroundDrawable(new ColorDrawable(0xff09090a));
         view = new PodView(this);
         setContentView(view);
+        PlayerService.watcher = view;
         setVolumeControlStream(AudioManager.STREAM_MUSIC);
         if (granted()) load(); else { view.setSongs(null); ask(); }
     }
@@ -52,7 +55,8 @@ public class MainActivity extends Activity {
     void load() {
         List<Song> songs = new ArrayList<>();
         String[] cols = {MediaStore.Audio.Media._ID, MediaStore.Audio.Media.TITLE,
-                MediaStore.Audio.Media.ARTIST, MediaStore.Audio.Media.ALBUM, MediaStore.Audio.Media.DURATION};
+                MediaStore.Audio.Media.ARTIST, MediaStore.Audio.Media.ALBUM, MediaStore.Audio.Media.DURATION,
+                MediaStore.Audio.Media.TRACK};
         try (Cursor c = getContentResolver().query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, cols,
                 MediaStore.Audio.Media.IS_MUSIC + "!=0", null,
                 MediaStore.Audio.Media.TITLE + " COLLATE NOCASE")) {
@@ -63,6 +67,7 @@ public class MainActivity extends Activity {
                 s.artist = clean(c.getString(2), "Unknown Artist");
                 s.album = clean(c.getString(3), "Unknown Album");
                 s.duration = c.getInt(4);
+                s.track = c.getInt(5);
                 songs.add(s);
             }
         } catch (Exception ignored) {
@@ -72,6 +77,11 @@ public class MainActivity extends Activity {
 
     static String clean(String s, String fallback) {
         return s == null || s.isEmpty() || s.equals("<unknown>") ? fallback : s;
+    }
+
+    @Override protected void onDestroy() {
+        if (PlayerService.watcher == view) PlayerService.watcher = null;
+        super.onDestroy();
     }
 
     @Override public void onBackPressed() {

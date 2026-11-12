@@ -15,7 +15,10 @@ import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
 
+import android.view.View;
+
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 /** Holds the MediaPlayer so music keeps going with the screen off. */
@@ -24,6 +27,10 @@ public class PlayerService extends Service {
     static List<Song> queue = new ArrayList<>();
     static int index = -1;
     static boolean playing, prepared;
+    static boolean shuffle;          // setting: shuffle whatever gets played
+    static int repeat;               // setting: 0 off, 1 one, 2 all
+    static boolean shuffled;         // the current queue is in random order
+    static View watcher;             // redrawn whenever playback changes
 
     MediaPlayer mp;
     AudioManager am;
@@ -36,14 +43,30 @@ public class PlayerService extends Service {
         return index >= 0 && index < queue.size() ? queue.get(index) : null;
     }
 
-    static void play(Context c, List<Song> q, int i) {
+    /** Plays q starting at song i; a shuffled queue still starts with the song that was picked. */
+    static void play(Context c, List<Song> q, int i, boolean shuffleAll) {
         queue = new ArrayList<>(q);
+        shuffled = shuffleAll || shuffle;
+        if (shuffled) {
+            Song first = shuffleAll ? null : queue.remove(i);
+            Collections.shuffle(queue);
+            if (first != null) queue.add(0, first);
+            i = 0;
+        }
         index = i;
         c.startForegroundService(new Intent(c, PlayerService.class));
     }
 
     static int position() {
-        return inst != null && prepared ? inst.mp.getCurrentPosition() : 0;
+        PlayerService s = inst;
+        return s != null && prepared && s.mp != null ? s.mp.getCurrentPosition() : 0;
+    }
+
+    static int duration() {
+        PlayerService s = inst;
+        if (s != null && prepared && s.mp != null) return s.mp.getDuration();
+        Song song = current();
+        return song == null ? 0 : song.duration;
     }
 
     @Override public IBinder onBind(Intent i) { return null; }
@@ -102,9 +125,10 @@ public class PlayerService extends Service {
 
     void next(boolean auto) {
         if (queue.isEmpty()) return;
-        if (index + 1 < queue.size()) { index++; start(); }
-        else if (auto) { index = 0; release(); playing = false; update(); }
-        else { index = 0; start(); }
+        if (auto && repeat == 1) start();
+        else if (index + 1 < queue.size()) { index++; start(); }
+        else if (!auto || repeat == 2) { index = 0; start(); }
+        else { index = 0; release(); playing = false; update(); }
     }
 
     void prev() {
@@ -121,6 +145,7 @@ public class PlayerService extends Service {
 
     /** Foreground while playing; when paused the notification stays but the service may be reclaimed. */
     void update() {
+        if (watcher != null) watcher.postInvalidate();
         Song s = current();
         Notification n = new Notification.Builder(this, "playback")
                 .setSmallIcon(playing ? android.R.drawable.ic_media_play : android.R.drawable.ic_media_pause)

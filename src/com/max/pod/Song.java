@@ -7,7 +7,7 @@ import android.provider.MediaStore;
 class Song {
     long id;
     String title, artist, album;
-    int duration;
+    int duration, track;
 
     Uri uri() {
         return ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id);

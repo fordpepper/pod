@@ -1,18 +1,23 @@
 package com.max.pod;
 
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.LinearGradient;
+import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.Path;
+import android.graphics.RadialGradient;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Shader;
 import android.graphics.Typeface;
+import android.media.AudioAttributes;
 import android.media.AudioManager;
 import android.media.MediaMetadataRetriever;
+import android.media.SoundPool;
 import android.os.BatteryManager;
 import android.os.Build;
 import android.os.SystemClock;
@@ -20,89 +25,175 @@ import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.text.TextPaint;
 import android.text.TextUtils;
+import android.util.Size;
 import android.view.MotionEvent;
 import android.view.View;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.TreeSet;
 
-/** The whole device: LCD, menus and click wheel, drawn on one canvas. */
+/**
+ * The working iPod. Hardware paints the body; this class draws what is on the screen and turns
+ * touches on the wheel into scrolling and button presses.
+ *
+ * The screen is drawn in the iPod's own 320x240 pixel grid (scaled up to the phone), and the
+ * positions, sizes and colours below were measured from Apple's screen captures of the real
+ * interface, so they are deliberately "magic": changing one moves it away from the original.
+ */
 public class PodView extends View {
-    static final int MAIN = 0, SONGS = 1, ARTISTS = 2, ALBUMS = 3, NOW = 4, MSG = 5, MUSIC = 6;
-    static final int ROWS = 9;
-    static final float STEP = (float) (Math.PI * 2 / 20);   // wheel travel per click
+    static final int MAIN = 0, MUSIC = 1, SETTINGS = 2, ARTISTS = 3, ALBUMS = 4, SONGS = 5, NOW = 6, MSG = 7;
+    static final int ROWS = 8;                                   // whole rows on screen; a 9th is cut off
+    static final float STEP = (float) (Math.PI * 2 / 24);        // wheel travel per click
+    static final int SLIDE_MS = 260;
+    static final String NOW_PLAYING = "Now Playing";
+    static final Shader.TileMode CLAMP = Shader.TileMode.CLAMP;
 
     static class Screen {
-        int type, sel, top;
-        String title;
-        List<String> items = new ArrayList<>();
+        final int type;
+        final String title;
+        final List<String> items = new ArrayList<>();
         List<Song> songs;
+        int sel, top;
 
-        Screen(int type, String title) { this.type = type; this.title = title; }
+        Screen(int type, String title, String... items) {
+            this.type = type;
+            this.title = title;
+            Collections.addAll(this.items, items);
+        }
+
+        /** Top-level menus share the screen with artwork; everything else uses the full width. */
+        boolean split() { return type == MAIN || type == MUSIC || type == SETTINGS || type == MSG; }
+    }
+
+    /** One picture drifting across the right half of the menus. */
+    static class Slide {
+        Bitmap bmp;
+        long start;
+        float x0, y0, z0, x1, y1, z1;
     }
 
     final MainActivity act;
+    final Hardware hw = new Hardware();
+    final SharedPreferences prefs;
     final Vibrator vib;
     final AudioManager am;
-    final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
-    final TextPaint tp = new TextPaint(Paint.ANTI_ALIAS_FLAG);
+    final Typeface bold, regular;
+    final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.DITHER_FLAG);
+    final Paint bp = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+    final TextPaint tp = new TextPaint(Paint.ANTI_ALIAS_FLAG | Paint.SUBPIXEL_TEXT_FLAG | Paint.LINEAR_TEXT_FLAG);
     final Path path = new Path();
-    final RectF lcd = new RectF(), tmp = new RectF();
+    final RectF rect = new RectF();
+    final Rect src = new Rect();
+    final Matrix matrix = new Matrix();
+    final Runnable ticker = this::invalidate;
+
     final List<Screen> stack = new ArrayList<>();
     List<Song> all = new ArrayList<>();
+    Screen leaving;                                              // screen sliding out, if any
+    long slideStart;
+    int slideDir;
 
-    // wheel geometry (set while drawing) and touch state
-    float cx, cy, R, r;
-    boolean onWheel, onCenter;
-    float lastAngle, downAngle, accum, travelled;
+    // wheel
+    boolean onWheel, onCenter, moved, held;
+    int sector = -1;                                             // 0 menu, 1 next, 2 play, 3 previous
+    float lastAngle, accum, travelled;
+    final Runnable hold = this::onHold;
 
-    boolean scrub;
+    // now playing
+    boolean scrub, clicker;
     long volUntil, scrubUntil;
     long artId = -1;
-    Bitmap art, menuArt;
-    long menuArtNext;
-    final Rect src = new Rect();
-    final Runnable ticker = this::invalidate;
+    Bitmap art, noArt;
+
+    // menu artwork
+    Slide slide, oldSlide;
+    long slideNext;
+    boolean slideLoading;
+
+    int battery = 100;
+    long batteryNext;
+    SoundPool pool;
+    int clickId;
 
     PodView(MainActivity a) {
         super(a);
         act = a;
+        prefs = a.getSharedPreferences("pod", Context.MODE_PRIVATE);
         vib = (Vibrator) a.getSystemService(Context.VIBRATOR_SERVICE);
         am = (AudioManager) a.getSystemService(Context.AUDIO_SERVICE);
+        bold = font("heros-bold.otf", Typeface.DEFAULT_BOLD);
+        regular = font("heros-regular.otf", Typeface.DEFAULT);
+        tp.setHinting(Paint.HINTING_OFF);
+        PlayerService.shuffle = prefs.getBoolean("shuffle", false);
+        PlayerService.repeat = prefs.getInt("repeat", 0);
+        clicker = prefs.getBoolean("clicker", true);
         stack.add(new Screen(MAIN, "iPod"));
+        loadClick();
     }
 
-    // ---------- menus ----------
+    Typeface font(String name, Typeface fallback) {
+        try {
+            return Typeface.createFromAsset(act.getAssets(), name);
+        } catch (Exception e) {
+            return fallback;
+        }
+    }
 
+    // ------------------------------------------------------------------ menus
+
+    /** songs == null means we have no permission to read the library yet. */
     void setSongs(List<Song> songs) {
-        stack.clear();
-        Screen s;
+        boolean locked = cur().type == MSG;
         if (songs == null) {
-            s = new Screen(MSG, "iPod");
-            s.items.add("Allow Music Access");
+            stack.clear();
+            stack.add(new Screen(MSG, "iPod", "Allow Access"));
         } else {
             all = songs;
-            s = new Screen(MAIN, "iPod");
-            Collections.addAll(s.items, "Music", "Shuffle Songs");
+            if (locked || stack.isEmpty() || cur().items.isEmpty()) {
+                stack.clear();
+                stack.add(new Screen(MAIN, "iPod", "Music", "Settings", "Shuffle Songs"));
+            }
         }
-        stack.add(s);
         invalidate();
     }
 
     Screen cur() { return stack.get(stack.size() - 1); }
 
+    void push(Screen s) {
+        leaving = cur();
+        slideDir = 1;
+        slideStart = SystemClock.uptimeMillis();
+        stack.add(s);
+    }
+
     Screen songScreen(String title, List<Song> songs) {
         Screen s = new Screen(SONGS, title);
         s.songs = songs;
         for (Song x : songs) s.items.add(x.title);
-        if (songs.isEmpty()) s.items.add("No Songs");
         return s;
+    }
+
+    void nowPlaying() {
+        scrub = false;
+        volUntil = 0;
+        push(new Screen(NOW, NOW_PLAYING));
     }
 
     void select() {
         Screen s = cur();
+        if (s.type == NOW) {
+            scrub = !scrub;
+            scrubUntil = SystemClock.uptimeMillis() + 5000;
+            volUntil = 0;
+            invalidate();
+            return;
+        }
         if (s.items.isEmpty()) return;
         String item = s.items.get(s.sel);
         switch (s.type) {
@@ -110,72 +201,85 @@ public class PodView extends View {
                 act.ask();
                 break;
             case MAIN:
-                if (item.equals("Music")) {
-                    Screen mu = new Screen(MUSIC, "Music");
-                    Collections.addAll(mu.items, "Artists", "Albums", "Songs");
-                    stack.add(mu);
-                } else if (item.equals("Shuffle Songs")) {
-                    if (all.isEmpty()) break;
-                    List<Song> q = new ArrayList<>(all);
-                    Collections.shuffle(q);
-                    PlayerService.play(act, q, 0);
-                    stack.add(new Screen(NOW, "Now Playing"));
-                } else if (PlayerService.current() != null) stack.add(new Screen(NOW, "Now Playing"));
+                if (item.equals("Music")) push(new Screen(MUSIC, "Music", "Artists", "Albums", "Songs"));
+                else if (item.equals("Settings")) push(new Screen(SETTINGS, "Settings", "Shuffle", "Repeat", "Clicker"));
+                else if (item.equals(NOW_PLAYING)) { if (PlayerService.current() != null) nowPlaying(); }
+                else if (!all.isEmpty()) {                       // Shuffle Songs
+                    PlayerService.play(act, all, 0, true);
+                    nowPlaying();
+                }
                 break;
             case MUSIC:
-                if (item.equals("Songs")) { stack.add(songScreen("Songs", all)); break; }
+                if (item.equals("Songs")) { push(songScreen("Songs", all)); break; }
                 boolean byArtist = item.equals("Artists");
                 Screen g = new Screen(byArtist ? ARTISTS : ALBUMS, item);
                 TreeSet<String> names = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
                 for (Song x : all) names.add(byArtist ? x.artist : x.album);
                 g.items.addAll(names);
-                stack.add(g);
+                push(g);
+                break;
+            case SETTINGS:
+                if (s.sel == 0) PlayerService.shuffle = !PlayerService.shuffle;
+                else if (s.sel == 1) PlayerService.repeat = (PlayerService.repeat + 1) % 3;
+                else clicker = !clicker;
+                prefs.edit().putBoolean("shuffle", PlayerService.shuffle)
+                        .putInt("repeat", PlayerService.repeat).putBoolean("clicker", clicker).apply();
                 break;
             case ARTISTS:
             case ALBUMS:
                 List<Song> sub = new ArrayList<>();
                 for (Song x : all) if ((s.type == ARTISTS ? x.artist : x.album).equalsIgnoreCase(item)) sub.add(x);
-                stack.add(songScreen(item, sub));
+                Collections.sort(sub, (a, b) -> {
+                    int byAlbum = a.album.compareToIgnoreCase(b.album);
+                    return byAlbum != 0 ? byAlbum : a.track != b.track ? a.track - b.track
+                            : a.title.compareToIgnoreCase(b.title);
+                });
+                push(songScreen(item, sub));
                 break;
             case SONGS:
-                if (s.songs.isEmpty()) break;
-                PlayerService.play(act, s.songs, s.sel);
-                stack.add(new Screen(NOW, "Now Playing"));
-                break;
-            case NOW:
-                scrub = !scrub;
-                scrubUntil = SystemClock.uptimeMillis() + 4000;
+                PlayerService.play(act, s.songs, s.sel, false);
+                nowPlaying();
                 break;
         }
         invalidate();
     }
 
-    /** MENU button: go back one level. Returns false at the top. */
+    /** MENU button: back one level. Returns false when already at the top. */
     boolean menu() {
         if (stack.size() <= 1) return false;
-        stack.remove(stack.size() - 1);
+        leaving = stack.remove(stack.size() - 1);
+        slideDir = -1;
+        slideStart = SystemClock.uptimeMillis();
         scrub = false;
         invalidate();
         return true;
     }
 
-    void playPause() {
-        if (PlayerService.inst != null) PlayerService.inst.toggle();
-        else if (!all.isEmpty()) PlayerService.play(act, all, 0);
+    String settingValue(int i) {
+        if (i == 0) return PlayerService.shuffle ? "Songs" : "Off";
+        if (i == 1) return PlayerService.repeat == 0 ? "Off" : PlayerService.repeat == 1 ? "One" : "All";
+        return clicker ? "On" : "Off";
     }
 
+    void playPause() {
+        if (PlayerService.inst != null) PlayerService.inst.toggle();
+        else if (!all.isEmpty()) PlayerService.play(act, all, 0, false);
+        invalidate();
+    }
+
+    /** One click of wheel travel. */
     void tick(int dir) {
         Screen s = cur();
         long now = SystemClock.uptimeMillis();
         if (s.type == NOW) {
             if (scrub && now < scrubUntil) {
-                if (PlayerService.inst != null) PlayerService.inst.seekBy(dir * 5000);
-                scrubUntil = now + 4000;
+                if (PlayerService.inst != null) PlayerService.inst.seekBy(dir * 4000);
+                scrubUntil = now + 5000;
             } else {
                 scrub = false;
                 am.adjustStreamVolume(AudioManager.STREAM_MUSIC,
                         dir > 0 ? AudioManager.ADJUST_RAISE : AudioManager.ADJUST_LOWER, 0);
-                volUntil = now + 2000;
+                volUntil = now + 2500;
             }
         } else {
             int n = s.sel + dir;
@@ -185,302 +289,466 @@ public class PodView extends View {
             if (n >= s.top + ROWS) s.top = n - ROWS + 1;
         }
         buzz(false);
-        am.playSoundEffect(AudioManager.FX_KEY_CLICK, 0.4f);
+        if (clicker && pool != null) pool.play(clickId, 1f, 1f, 1, 0, 1f);
         invalidate();
     }
 
+    // ------------------------------------------------------------------ feel
+
     void buzz(boolean strong) {
-        if (vib == null) return;
-        if (Build.VERSION.SDK_INT >= 29)
-            vib.vibrate(VibrationEffect.createPredefined(
-                    strong ? VibrationEffect.EFFECT_CLICK : VibrationEffect.EFFECT_TICK));
-        else vib.vibrate(VibrationEffect.createOneShot(strong ? 14 : 6, strong ? 200 : 90));
+        if (vib == null || !vib.hasVibrator()) return;
+        VibrationEffect fx = Build.VERSION.SDK_INT >= 29
+                ? VibrationEffect.createPredefined(strong ? VibrationEffect.EFFECT_CLICK : VibrationEffect.EFFECT_TICK)
+                : VibrationEffect.createOneShot(strong ? 14 : 6, strong ? 200 : 90);
+        // "sonification" marks it as touch feedback, so the phone's touch-vibration setting governs it
+        vib.vibrate(fx, new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build());
     }
 
-    // ---------- touch ----------
+    /** The clicker: a short damped tick, played on the music stream like the iPod plays it in the earphones. */
+    void loadClick() {
+        try {
+            int rate = 44100, n = rate * 30 / 1000;      // the tick itself dies away within ~4 ms
+            ByteBuffer b = ByteBuffer.allocate(44 + n * 2).order(ByteOrder.LITTLE_ENDIAN);
+            b.put("RIFF".getBytes()).putInt(36 + n * 2).put("WAVEfmt ".getBytes()).putInt(16)
+                    .putShort((short) 1).putShort((short) 1).putInt(rate).putInt(rate * 2)
+                    .putShort((short) 2).putShort((short) 16).put("data".getBytes()).putInt(n * 2);
+            for (int i = 0; i < n; i++) {
+                double t = i / (double) rate;
+                b.putShort((short) (Math.sin(2 * Math.PI * 2500 * t) * Math.exp(-t / 0.0007) * 0.35 * 32767));
+            }
+            File f = new File(act.getCacheDir(), "click.wav");
+            try (FileOutputStream out = new FileOutputStream(f)) {
+                out.write(b.array());
+            }
+            pool = new SoundPool.Builder().setMaxStreams(3).setAudioAttributes(new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build()).build();
+            clickId = pool.load(f.getPath(), 1);
+        } catch (Exception e) {
+            pool = null;
+        }
+    }
+
+    // ------------------------------------------------------------------ touch
 
     @Override public boolean onTouchEvent(MotionEvent e) {
-        float dx = e.getX() - cx, dy = e.getY() - cy;
+        float dx = e.getX() - hw.cx, dy = e.getY() - hw.cy;
         float d = (float) Math.hypot(dx, dy), a = (float) Math.atan2(dy, dx);
         switch (e.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
-                onCenter = d < r;
-                onWheel = !onCenter && d <= R * 1.08f;
-                lastAngle = downAngle = a;
+                onCenter = d < hw.r;
+                onWheel = !onCenter && d <= hw.R * 1.06f;
+                moved = held = false;
+                lastAngle = a;
                 accum = travelled = 0;
-                if (onCenter) buzz(true);
+                if (onWheel) {
+                    double deg = Math.toDegrees(a);              // 0 = right, 90 = down
+                    sector = deg > -135 && deg <= -45 ? 0 : deg > -45 && deg <= 45 ? 1 : deg > 45 && deg <= 135 ? 2 : 3;
+                    postDelayed(hold, 600);
+                } else sector = -1;
                 invalidate();
                 return true;
             case MotionEvent.ACTION_MOVE:
-                if (!onWheel || d < r * 0.5f) { lastAngle = a; return true; }
+                if (!onWheel || d < hw.r * 0.6f) { lastAngle = a; return true; }
                 float da = a - lastAngle;
                 if (da > Math.PI) da -= 2 * Math.PI;
                 if (da < -Math.PI) da += 2 * Math.PI;
                 lastAngle = a;
                 accum += da;
                 travelled += Math.abs(da);
+                if (!moved && travelled > STEP * 0.7f) {         // this is a scroll, not a button press
+                    moved = true;
+                    removeCallbacks(hold);
+                    invalidate();
+                }
+                if (held) return true;
                 while (accum >= STEP) { accum -= STEP; tick(1); }
                 while (accum <= -STEP) { accum += STEP; tick(-1); }
                 return true;
             case MotionEvent.ACTION_UP:
-                if (onCenter && d < r * 1.3f) select();
-                else if (onWheel && travelled < STEP * 0.6f) {
+                removeCallbacks(hold);
+                if (onCenter && d < hw.r * 1.4f) {
                     buzz(true);
-                    double deg = Math.toDegrees(downAngle);          // 0 = right, 90 = down
-                    if (deg > -135 && deg <= -45) menu();
-                    else if (deg > -45 && deg <= 45) { if (PlayerService.inst != null) PlayerService.inst.next(false); }
-                    else if (deg > 45 && deg <= 135) playPause();
-                    else if (PlayerService.inst != null) PlayerService.inst.prev();
+                    select();
+                } else if (onWheel && !moved && !held) {
+                    buzz(true);
+                    PlayerService ps = PlayerService.inst;
+                    if (sector == 0) menu();
+                    else if (sector == 1) { if (ps != null) ps.next(false); }
+                    else if (sector == 2) playPause();
+                    else if (ps != null) ps.prev();
                 }
                 // fall through
             case MotionEvent.ACTION_CANCEL:
+                removeCallbacks(hold);
                 onCenter = onWheel = false;
+                sector = -1;
                 invalidate();
                 return true;
         }
         return true;
     }
 
-    // ---------- drawing ----------
-
-    Shader grad(float y0, float y1, int c0, int c1) {
-        return new LinearGradient(0, y0, 0, y1, c0, c1, Shader.TileMode.CLAMP);
+    /** A button kept down: MENU jumps to the main menu, next/previous wind through the song. */
+    void onHold() {
+        if (!onWheel || moved) return;
+        PlayerService ps = PlayerService.inst;
+        if (sector == 0 && !held) {
+            held = true;
+            if (stack.size() > 1) {
+                buzz(true);
+                leaving = cur();
+                while (stack.size() > 1) stack.remove(stack.size() - 1);
+                slideDir = -1;
+                slideStart = SystemClock.uptimeMillis();
+                scrub = false;
+            }
+        } else if ((sector == 1 || sector == 3) && ps != null) {
+            if (!held) buzz(true);
+            held = true;
+            ps.seekBy(sector == 1 ? 5000 : -5000);
+            postDelayed(hold, 250);
+        }
+        invalidate();
     }
 
-    void text(Canvas c, String s, float x, float y, float maxW, float size, int color, boolean bold, Paint.Align al) {
+    // ------------------------------------------------------------------ drawing helpers
+
+    Paint fill(int color) {
+        p.setShader(null);
+        p.setStyle(Paint.Style.FILL);
+        p.setColor(color);
+        return p;
+    }
+
+    Paint shade(Shader s) {
+        fill(0xff000000);
+        p.setShader(s);
+        return p;
+    }
+
+    static Shader vertical(float y0, float y1, int[] colors, float[] stops) {
+        return new LinearGradient(0, y0, 0, y1, colors, stops, CLAMP);
+    }
+
+    void text(Canvas c, String s, float x, float y, float maxW, float size, int color, Typeface face, Paint.Align al) {
+        tp.setTypeface(face);
         tp.setTextSize(size);
         tp.setColor(color);
-        tp.setTypeface(bold ? Typeface.DEFAULT_BOLD : Typeface.DEFAULT);
         tp.setTextAlign(al);
-        c.drawText(TextUtils.ellipsize(s, tp, maxW, TextUtils.TruncateAt.END).toString(), x, y, tp);
+        CharSequence cs = TextUtils.ellipsize(s, tp, maxW, TextUtils.TruncateAt.END);
+        c.drawText(cs, 0, cs.length(), x, y, tp);
+    }
+
+    // gradients sampled from the real interface, in 320x240 screen pixels
+    static final Shader HEADER = vertical(0, 19,
+            new int[]{0xfffdfdfd, 0xffededed, 0xffe7e7e7, 0xffd8d8d8, 0xffbbbbbb, 0xffababab},
+            new float[]{0f, 0.2f, 0.39f, 0.5f, 0.76f, 1f});
+    static final Shader SELECTED = vertical(1, 21,
+            new int[]{0xff4aabd6, 0xff3eabe3, 0xff3ba1e3, 0xff2b93da, 0xff1584d3},
+            new float[]{0f, 0.1f, 0.35f, 0.6f, 1f});
+    static final Shader BATTERY = vertical(4, 14,
+            new int[]{0xff98ca85, 0xffc1fda7, 0xffd1febb, 0xffbef0a9, 0xff9ce685, 0xff4da537, 0xff3e9f2e, 0xff339d21, 0xff388a28},
+            new float[]{0f, 0.11f, 0.22f, 0.33f, 0.47f, 0.5f, 0.62f, 0.85f, 1f});
+    static final Shader BATTERY_LOW = vertical(4, 14,
+            new int[]{0xffe59a8c, 0xffffc1b3, 0xfff2a092, 0xffd9432f, 0xffc0301e, 0xffa82a1a},
+            new float[]{0f, 0.2f, 0.47f, 0.5f, 0.8f, 1f});
+    static final Shader BATTERY_EMPTY = vertical(4, 14, new int[]{0xffc9c9c9, 0xfff4f4f4, 0xffe2e2e2}, null);
+    static final Shader BATTERY_CASE = vertical(3, 15, new int[]{0xff3a4b3a, 0xff5c7357}, null);
+    static final Shader PLAY = vertical(3.3f, 14.3f,
+            new int[]{0xff2a77a5, 0xff3b9ed9, 0xff52dcff, 0xff36a8e4, 0xff236a96},
+            new float[]{0f, 0.22f, 0.5f, 0.76f, 1f});
+    static final Shader TRACK = vertical(207, 219,
+            new int[]{0xfffbfbfb, 0xffffffff, 0xfff6f6f6, 0xfff0f0f0, 0xffe3e3e3, 0xffe5e5e5, 0xfff2f2f2, 0xffededed},
+            new float[]{0f, 0.08f, 0.25f, 0.42f, 0.58f, 0.67f, 0.83f, 1f});
+    static final Shader PROGRESS = vertical(207, 219,
+            new int[]{0xff87abff, 0xff6c99f6, 0xff6da3f9, 0xff66a3ff, 0xff3d89eb, 0xff3698f9, 0xff32a3ff, 0xff41b3fc, 0xff5cbbff},
+            new float[]{0f, 0.17f, 0.33f, 0.46f, 0.5f, 0.58f, 0.67f, 0.83f, 1f});
+    static final Shader PROGRESS_GLOW = vertical(220, 229, new int[]{0x405cbbff, 0x385cbbff, 0x005cbbff}, new float[]{0f, 0.3f, 1f});
+    static final Shader PANE_SHADOW = new LinearGradient(160, 0, 171, 0,
+            new int[]{0x66000000, 0x42000000, 0x22000000, 0x00000000}, new float[]{0f, 0.15f, 0.5f, 1f}, CLAMP);
+    static final Shader SCROLL_THUMB = new LinearGradient(313, 0, 319, 0,
+            new int[]{0xffa9aeb6, 0xff8b9199, 0xff6d737b}, null, CLAMP);
+    static final Shader REFLECTION = new LinearGradient(0, 0, 0, 0.24f, 0xb0ffffff, 0xffffffff, CLAMP);
+
+    // ------------------------------------------------------------------ drawing
+
+    @Override protected void onSizeChanged(int w, int h, int ow, int oh) {
+        if (w > 0 && h > 0) hw.render(w, h);
     }
 
     @Override protected void onDraw(Canvas c) {
-        float w = getWidth(), h = getHeight();
-        p.setStyle(Paint.Style.FILL);
-        p.setShader(null);
-        p.setColor(0xff000000);
-        c.drawRect(0, 0, w, h, p);
-
-        // the device at its real proportions (61.8 x 103.5 mm), centred
-        float bw = Math.min(w, h / 1.675f), bh = bw * 1.675f, bx = (w - bw) / 2, by = (h - bh) / 2;
-        float rad = bw * 0.075f;
-        tmp.set(bx, by, bx + bw, by + bh);
-        p.setShader(grad(by, by + bh, 0xffeff0f2, 0xffc8cace));
-        c.drawRoundRect(tmp, rad, rad, p);
-        p.setShader(null);
-        p.setStyle(Paint.Style.STROKE);          // polished edge
-        p.setStrokeWidth(bw * 0.007f);
-        p.setColor(0xfffafafb);
-        tmp.inset(bw * 0.0035f, bw * 0.0035f);
-        c.drawRoundRect(tmp, rad, rad, p);
-        p.setStyle(Paint.Style.FILL);
-
-        R = bw * 0.31f;
-        r = R * 0.34f;
-        cx = bx + bw / 2;
-        cy = by + bh * 0.705f;
-
-        // black glass window with the 4:3 LCD inside
-        float gw = bw * 0.85f, gh = gw * 0.76f, gx = cx - gw / 2, gy = by + bh * 0.065f;
-        tmp.set(gx, gy, gx + gw, gy + gh);
-        p.setColor(0xff0c0c0e);
-        c.drawRoundRect(tmp, bw * 0.012f, bw * 0.012f, p);
-        float lw = gw * 0.95f, lh = lw * 0.75f, ly = gy + (gh - lh) / 2;
-        lcd.set(cx - lw / 2, ly, cx + lw / 2, ly + lh);
-        c.save();
-        c.clipRect(lcd);
-        p.setColor(0xffffffff);
-        c.drawRect(lcd, p);
-        drawScreen(c);
-        // faint glass glare
-        p.setShader(grad(lcd.top, lcd.top + lcd.height() * 0.5f, 0x22ffffff, 0x00ffffff));
-        c.drawRect(lcd, p);
-        p.setShader(null);
-        c.restore();
-
-        drawWheel(c);
-
-        removeCallbacks(ticker);
-        postDelayed(ticker, PlayerService.playing
-                || SystemClock.uptimeMillis() < Math.max(volUntil, scrubUntil) ? 250 : 1000);
-    }
-
-    void drawScreen(Canvas c) {
-        Screen s = cur();
-        float L = lcd.left, T = lcd.top, W = lcd.width(), H = lcd.height();
-        float th = H * 0.09f;
-        if (s.type == MAIN) {                     // "Now Playing" only exists while something is loaded
-            boolean has = s.items.contains("Now Playing"), want = PlayerService.current() != null;
-            if (want && !has) s.items.add("Now Playing");
-            if (!want && has) { s.items.remove("Now Playing"); s.sel = Math.min(s.sel, s.items.size() - 1); }
-        }
-
-        // title bar
-        p.setShader(grad(T, T + th, 0xfff7f8f9, 0xffb4b8bf));
-        c.drawRect(L, T, lcd.right, T + th, p);
-        p.setShader(null);
-        p.setColor(0xff8a8e96);
-        c.drawRect(L, T + th - 2, lcd.right, T + th, p);
-        text(c, s.title, L + W / 2, T + th * 0.72f, W * 0.6f, th * 0.62f, 0xff111111, true, Paint.Align.CENTER);
-
-        // play / pause indicator
-        if (PlayerService.current() != null) {
-            float ix = L + th * 0.4f, iy = T + th * 0.25f, is = th * 0.5f;
-            p.setColor(0xff2f7de1);
-            if (PlayerService.playing) {
-                path.rewind();
-                path.moveTo(ix, iy); path.lineTo(ix + is * 0.9f, iy + is / 2); path.lineTo(ix, iy + is); path.close();
-                c.drawPath(path, p);
-            } else {
-                c.drawRect(ix, iy, ix + is * 0.32f, iy + is, p);
-                c.drawRect(ix + is * 0.55f, iy, ix + is * 0.87f, iy + is, p);
-            }
-        }
-
-        // battery (real level)
-        int lvl = ((BatteryManager) act.getSystemService(Context.BATTERY_SERVICE))
-                .getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY);
-        if (lvl <= 0 || lvl > 100) lvl = 100;
-        float bw = th * 1.1f, bh = th * 0.48f, bx = lcd.right - bw - th * 0.45f, by = T + (th - bh) / 2;
-        p.setColor(0xff6c7078);
-        c.drawRect(bx, by, bx + bw, by + bh, p);
-        c.drawRect(bx + bw, by + bh * 0.28f, bx + bw + bh * 0.18f, by + bh * 0.72f, p);
-        p.setColor(0xffffffff);
-        c.drawRect(bx + 2, by + 2, bx + bw - 2, by + bh - 2, p);
-        p.setShader(grad(by, by + bh, lvl > 20 ? 0xff9be36a : 0xffff8a7a, lvl > 20 ? 0xff3fae2a : 0xffd63a2a));
-        c.drawRect(bx + 3, by + 3, bx + 3 + (bw - 6) * lvl / 100f, by + bh - 3, p);
-        p.setShader(null);
-
-        if (s.type == NOW) { drawNowPlaying(c, T + th, H - th); return; }
-
-        // list
-        float rh = (H - th) / ROWS, n = s.items.size();
-        boolean bar = n > ROWS;
-        boolean split = s.type == MAIN || s.type == MUSIC;      // menu left, artwork right
-        float listR = split ? L + W / 2 : lcd.right - (bar ? rh * 0.32f : 0);
-        if (split) drawMenuArt(c, listR, T + th);
-        boolean sub = s.type == MAIN || s.type == MUSIC || s.type == ARTISTS || s.type == ALBUMS;
-        for (int i = s.top; i < Math.min(n, s.top + ROWS); i++) {
-            float y = T + th + (i - s.top) * rh;
-            boolean sel = i == s.sel;
-            if (sel) {
-                p.setShader(grad(y, y + rh, 0xff62b0f6, 0xff1a66d2));
-                c.drawRect(L, y, listR, y + rh, p);
-                p.setShader(null);
-            }
-            boolean chevron = sub && !s.items.get(i).equals("Shuffle Songs");
-            text(c, s.items.get(i), L + rh * 0.3f, y + rh * 0.7f, listR - L - rh * (chevron ? 1.1f : 0.5f),
-                    rh * 0.6f, sel ? 0xffffffff : 0xff111111, true, Paint.Align.LEFT);
-            if (chevron) {
-                float ax = listR - rh * 0.55f, ay = y + rh / 2, as = rh * 0.17f;
-                p.setStyle(Paint.Style.STROKE);
-                p.setStrokeWidth(rh * 0.09f);
-                p.setColor(sel ? 0xffffffff : 0xff555555);
-                path.rewind();
-                path.moveTo(ax - as * 0.6f, ay - as); path.lineTo(ax + as * 0.6f, ay); path.lineTo(ax - as * 0.6f, ay + as);
-                c.drawPath(path, p);
-                p.setStyle(Paint.Style.FILL);
-            }
-        }
-        if (bar && !split) {
-            float top = T + th, hh = H - th;
-            p.setColor(0xffe3e5e8);
-            c.drawRect(listR, top, lcd.right, lcd.bottom, p);
-            p.setShader(grad(top, lcd.bottom, 0xff9aa0aa, 0xff6f757f));
-            float th2 = Math.max(hh * ROWS / n, rh * 0.6f);
-            float ty = top + (hh - th2) * s.top / (n - ROWS);
-            tmp.set(listR + 3, ty + 3, lcd.right - 3, ty + th2 - 3);
-            c.drawRoundRect(tmp, 8, 8, p);
-            p.setShader(null);
-        }
-    }
-
-    void drawNowPlaying(Canvas c, float top, float H) {
-        Song s = PlayerService.current();
-        float L = lcd.left, W = lcd.width(), pad = W * 0.045f;
-        if (s == null) {
-            text(c, "Nothing Playing", L + W / 2, top + H / 2, W, H * 0.08f, 0xff555555, true, Paint.Align.CENTER);
-            return;
-        }
-        float fs = H * 0.075f;
-        text(c, (PlayerService.index + 1) + " of " + PlayerService.queue.size(), L + pad, top + fs * 1.5f,
-                W, fs * 0.85f, 0xff444444, false, Paint.Align.LEFT);
-
-        // album art
-        float as = H * 0.44f, ax = L + pad, ay = top + H * 0.15f;
-        if (artId != s.id) loadArt(s);
-        tmp.set(ax, ay, ax + as, ay + as);
-        if (art != null) {
-            c.drawBitmap(art, null, tmp, p);
-            c.save();                              // mirrored reflection under the cover
-            c.clipRect(ax, ay + as, ax + as, ay + as * 1.22f);
-            c.scale(1, -1, 0, ay + as);
-            p.setAlpha(60);
-            c.drawBitmap(art, null, tmp, p);
-            p.setAlpha(255);
-            c.restore();
-        } else {
-            p.setShader(grad(ay, ay + as, 0xffe9ebee, 0xffc3c7cd));
-            c.drawRect(tmp, p);
-            p.setShader(null);
-            p.setColor(0xff8e939b);
-            float nx = ax + as * 0.42f, ny = ay + as * 0.66f, nr = as * 0.1f;
-            c.drawCircle(nx, ny, nr, p);
-            c.drawRect(nx + nr * 0.6f, ny - as * 0.4f, nx + nr, ny, p);
-            c.drawRect(nx + nr * 0.6f, ny - as * 0.4f, nx + nr * 2.6f, ny - as * 0.33f, p);
-        }
-        p.setStyle(Paint.Style.STROKE);
-        p.setStrokeWidth(2);
-        p.setColor(0xff9a9ea6);
-        c.drawRect(tmp, p);
-        p.setStyle(Paint.Style.FILL);
-
-        float tx = ax + as + pad, tw = lcd.right - pad - tx;
-        text(c, s.title, tx, ay + fs * 1.6f, tw, fs * 1.05f, 0xff111111, true, Paint.Align.LEFT);
-        text(c, s.artist, tx, ay + fs * 3.2f, tw, fs * 0.95f, 0xff333333, false, Paint.Align.LEFT);
-        text(c, s.album, tx, ay + fs * 4.6f, tw, fs * 0.95f, 0xff666666, false, Paint.Align.LEFT);
-
-        // progress / volume / scrub bar
+        if (hw.bitmap == null) return;
         long now = SystemClock.uptimeMillis();
-        if (scrub && now >= scrubUntil) scrub = false;
-        boolean vol = !scrub && now < volUntil;
-        int dur = PlayerService.prepared ? PlayerService.inst.mp.getDuration() : s.duration;
-        int pos = PlayerService.position();
-        float frac = vol ? am.getStreamVolume(AudioManager.STREAM_MUSIC)
-                / (float) am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-                : dur > 0 ? Math.min(1f, pos / (float) dur) : 0;
-        float bx = L + pad, bw = W - 2 * pad, bh = H * 0.06f, by = top + H * 0.76f;
-        tmp.set(bx, by, bx + bw, by + bh);
-        p.setShader(grad(by, by + bh, 0xffc9ccd1, 0xfff1f2f4));
-        c.drawRoundRect(tmp, bh / 2, bh / 2, p);
+        c.drawBitmap(hw.bitmap, 0, 0, null);
+
+        // the lit screen, in iPod pixels
         c.save();
-        c.clipRect(bx, by, bx + bw * frac, by + bh);
-        p.setShader(grad(by, by + bh, 0xff7fc0fb, 0xff1a66d2));
-        c.drawRoundRect(tmp, bh / 2, bh / 2, p);
+        c.clipRect(hw.lcd);
+        c.translate(hw.lcd.left, hw.lcd.top);
+        c.scale(hw.lcd.width() / 320f, hw.lcd.height() / 240f);
+        boolean sliding = drawScreens(c, now);
         c.restore();
-        p.setShader(null);
-        if (scrub) {
-            float kx = bx + bw * frac, ky = by + bh / 2, ks = bh * 0.85f;
-            p.setColor(0xff222222);
-            path.rewind();
-            path.moveTo(kx, ky - ks); path.lineTo(kx + ks, ky); path.lineTo(kx, ky + ks); path.lineTo(kx - ks, ky); path.close();
-            c.drawPath(path, p);
+
+        // soft reflection on the glass in front of it
+        c.drawPath(hw.windowPath, shade(hw.glare));
+
+        // parts of the wheel dip under the thumb
+        if (onCenter) {
+            c.drawCircle(hw.cx, hw.cy, hw.r, shade(new RadialGradient(hw.cx, hw.cy, hw.r,
+                    new int[]{0x2e000000, 0x16000000, 0x34000000}, new float[]{0f, 0.8f, 1f}, CLAMP)));
+        } else if (onWheel && !moved && sector >= 0) {
+            float[] ox = {0, 1, 0, -1}, oy = {-1, 0, 1, 0};
+            float px = hw.cx + ox[sector] * hw.R * 0.72f, py = hw.cy + oy[sector] * hw.R * 0.72f;
+            c.save();
+            c.clipPath(hw.ring);
+            c.drawCircle(px, py, hw.R * 0.75f, shade(new RadialGradient(px, py, hw.R * 0.75f,
+                    new int[]{0x30000000, 0x14000000, 0x00000000}, new float[]{0f, 0.5f, 1f}, CLAMP)));
+            c.restore();
         }
-        float ty = by + bh + fs * 1.3f;
-        if (vol) text(c, "Volume", L + W / 2, ty, W, fs * 0.85f, 0xff333333, false, Paint.Align.CENTER);
-        else {
-            text(c, time(pos), bx, ty, W, fs * 0.85f, 0xff333333, false, Paint.Align.LEFT);
-            text(c, "-" + time(Math.max(0, dur - pos)), bx + bw, ty, W, fs * 0.85f, 0xff333333, false, Paint.Align.RIGHT);
-        }
+
+        // keep animating only while something on screen is moving
+        Screen s = cur();
+        removeCallbacks(ticker);
+        long wait = sliding ? 0 : s.split() ? 40
+                : s.type == NOW && (PlayerService.playing || now < Math.max(volUntil, scrubUntil)) ? 200 : 30000;
+        if (wait == 0) postInvalidateOnAnimation(); else postDelayed(ticker, wait);
     }
 
-    static String time(int ms) {
-        int sec = ms / 1000;
-        return sec / 60 + ":" + (sec % 60 < 10 ? "0" : "") + sec % 60;
+    /** Draws the current screen, or two screens mid-slide. Returns true while a slide is running. */
+    boolean drawScreens(Canvas c, long now) {
+        Screen s = cur();
+        if (s.type == MAIN) {                                    // "Now Playing" exists only once something is loaded
+            boolean has = s.items.contains(NOW_PLAYING), want = PlayerService.current() != null;
+            if (want && !has) s.items.add(NOW_PLAYING);
+            if (!want && has) { s.items.remove(NOW_PLAYING); s.sel = Math.min(s.sel, s.items.size() - 1); }
+        }
+        float t = leaving == null ? 1f : (now - slideStart) / (float) SLIDE_MS;
+        if (t >= 1f) {
+            leaving = null;
+            if (s.split()) drawArt(c, now);
+            drawScreen(c, s);
+            return false;
+        }
+        float ease = 1 - (1 - t) * (1 - t);
+        boolean menus = s.split() && leaving.split();            // only the menu half moves, artwork stays
+        float span = menus ? 160 : 320;
+        if (menus) {
+            drawArt(c, now);
+            c.save();
+            c.clipRect(0, 0, 160, 240);
+        }
+        for (int i = 0; i < 2; i++) {
+            Screen which = i == 0 ? leaving : s;
+            c.save();
+            c.translate(i == 0 ? -slideDir * ease * span : slideDir * (1 - ease) * span, 0);
+            if (!menus) c.clipRect(0, 0, 320, 240);
+            if (!menus && which.split()) drawArt(c, now);
+            drawScreen(c, which);
+            c.restore();
+        }
+        if (menus) c.restore();
+        return true;
+    }
+
+    void drawScreen(Canvas c, Screen s) {
+        if (s.type == NOW) { drawNowPlaying(c); return; }
+        boolean split = s.split();
+        float w = split ? 160 : 320, inset = split ? 6 : 9;
+        int n = s.items.size();
+        boolean bar = !split && n > ROWS;
+        float right = bar ? 311 : w;
+        c.drawRect(0, 0, w, 240, fill(0xffffffff));
+        boolean arrows = s.type != SONGS && s.type != SETTINGS && s.type != MSG;
+        for (int i = s.top; i < Math.min(n, s.top + ROWS + 1); i++) {
+            float y = 20 + 25 * (i - s.top);
+            boolean sel = i == s.sel;
+            String value = s.type == SETTINGS ? settingValue(i) : null;
+            boolean arrow = sel && arrows && !s.items.get(i).equals("Shuffle Songs");
+            c.save();
+            c.translate(0, y);
+            if (sel) {
+                c.drawRect(0, 0, right, 1, fill(0xff9addf8));
+                c.drawRect(0, 1, right, 21, shade(SELECTED));
+                c.drawRect(0, 21, right, 22, fill(0xff1d7bc1));
+                c.drawRect(0, 22, right, 23, fill(0xff154e83));
+            }
+            int ink = sel ? 0xffffffff : 0xff000000;
+            float room = right - inset - (arrow ? 17 : 6);
+            if (value != null) {
+                text(c, value, right - 7, 16, 60, 15, ink, bold, Paint.Align.RIGHT);
+                room -= tp.measureText(value) + 6;
+            }
+            text(c, s.items.get(i), inset, 16, room, 15, ink, bold, Paint.Align.LEFT);
+            if (arrow) {
+                path.rewind();
+                path.moveTo(right - 11.4f, 7.5f);
+                path.lineTo(right - 7.5f, 11.5f);
+                path.lineTo(right - 11.4f, 15.5f);
+                fill(0xffffffff).setStyle(Paint.Style.STROKE);
+                p.setStrokeWidth(2.9f);
+                p.setStrokeCap(Paint.Cap.ROUND);
+                p.setStrokeJoin(Paint.Join.ROUND);
+                c.drawPath(path, p);
+            }
+            c.restore();
+        }
+        if (n == 0) text(c, s.type == SONGS ? "No Songs" : "No Music", w / 2, 128, w - 20, 15, 0xff8a8a8a, bold, Paint.Align.CENTER);
+        if (bar) {
+            c.drawRect(311, 20, 320, 240, fill(0xfff1f1f1));
+            c.drawRect(311, 20, 312, 240, fill(0xffc4c4c4));
+            float h = 220, th = Math.max(18, h * ROWS / n), ty = 20 + (h - th) * s.top / (float) (n - ROWS);
+            rect.set(313.5f, ty + 2, 318.5f, ty + th - 2);
+            c.drawRoundRect(rect, 2.5f, 2.5f, shade(SCROLL_THUMB));
+        }
+        header(c, w, s.title, inset);
+    }
+
+    /** Title bar with the play state and battery at its right-hand end. */
+    void header(Canvas c, float w, String title, float inset) {
+        c.drawRect(0, 0, w, 19, shade(HEADER));
+        c.drawRect(0, 19, w, 20, fill(0xff6a6a6a));
+        text(c, title, inset, 14, w - inset - 54, 12, 0xff000000, bold, Paint.Align.LEFT);
+
+        long now = SystemClock.uptimeMillis();
+        if (now >= batteryNext) {
+            batteryNext = now + 30000;
+            int lvl = ((BatteryManager) act.getSystemService(Context.BATTERY_SERVICE))
+                    .getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY);
+            battery = lvl > 0 && lvl <= 100 ? lvl : 100;
+        }
+        c.save();
+        float nudge = w < 320 ? 1 : 0;                          // the half-width bar sits a pixel further in
+        c.translate(w - 29 - nudge, 0);
+        c.drawRect(0, 3, 24, 15, shade(BATTERY_CASE));
+        c.drawRect(24, 7, 26, 11, fill(0xff6f716d));
+        c.drawRect(1, 4, 23, 14, shade(BATTERY_EMPTY));
+        c.drawRect(1, 4, 1 + 22 * battery / 100f, 14, shade(battery > 20 ? BATTERY : BATTERY_LOW));
+        c.restore();
+
+        if (PlayerService.current() == null) return;
+        c.save();
+        c.translate(w - 45 - nudge, 0);
+        path.rewind();
+        if (PlayerService.playing) {
+            path.moveTo(0.4f, 3.3f);
+            path.lineTo(10.9f, 8.8f);
+            path.lineTo(0.4f, 14.3f);
+            path.close();
+        } else {
+            path.addRect(0.6f, 3.9f, 4.2f, 13.7f, Path.Direction.CW);
+            path.addRect(6.4f, 3.9f, 10f, 13.7f, Path.Direction.CW);
+        }
+        c.drawPath(path, shade(PLAY));
+        fill(0xff16528a).setStyle(Paint.Style.STROKE);
+        p.setStrokeWidth(0.9f);
+        p.setStrokeJoin(Paint.Join.ROUND);
+        c.drawPath(path, p);
+        c.restore();
+    }
+
+    // ---- artwork beside the menus
+
+    void drawArt(Canvas c, long now) {
+        if (!slideLoading && now >= slideNext && !all.isEmpty()) {
+            slideLoading = true;
+            final List<Song> pool = all;
+            new Thread(() -> {
+                Bitmap found = null;
+                for (int i = 0; i < 5 && found == null; i++)
+                    found = decode(pool.get((int) (Math.random() * pool.size())));
+                final Bitmap bmp = found;
+                post(() -> {
+                    slideLoading = false;
+                    long t = SystemClock.uptimeMillis();
+                    slideNext = t + (bmp == null ? 60000 : 11000);
+                    if (bmp == null) return;
+                    Slide s = new Slide();
+                    s.bmp = bmp;
+                    s.start = t;
+                    boolean in = Math.random() < 0.5;            // zoom in or out, drifting corner to corner
+                    s.z0 = in ? 1.12f : 1.34f;
+                    s.z1 = in ? 1.34f : 1.12f;
+                    s.x0 = (float) Math.random() * 0.5f;
+                    s.x1 = 0.5f + (float) Math.random() * 0.5f;
+                    s.y0 = (float) Math.random();
+                    s.y1 = 1 - s.y0;
+                    oldSlide = slide;
+                    slide = s;
+                    invalidate();
+                });
+            }).start();
+        }
+        c.save();
+        c.clipRect(160, 0, 320, 240);
+        if (slide == null) {
+            Bitmap b = placeholder();
+            rect.set(120, 0, 360, 240);
+            c.drawBitmap(b, null, rect, bp);
+        } else {
+            float fade = Math.min(1f, (now - slide.start) / 1200f);
+            if (oldSlide != null && fade < 1f) drawSlide(c, oldSlide, now, 255);
+            else oldSlide = null;
+            drawSlide(c, slide, now, (int) (fade * 255));
+        }
+        c.drawRect(160, 0, 171, 240, shade(PANE_SHADOW));       // the menu pane sits above the picture
+        c.restore();
+    }
+
+    void drawSlide(Canvas c, Slide s, long now, int alpha) {
+        float t = Math.min(1f, (now - s.start) / 14000f);
+        float size = 240 * (s.z0 + (s.z1 - s.z0) * t);
+        float x = 160 - (size - 160) * (s.x0 + (s.x1 - s.x0) * t), y = -(size - 240) * (s.y0 + (s.y1 - s.y0) * t);
+        square(s.bmp);
+        rect.set(x, y, x + size, y + size);
+        bp.setAlpha(alpha);
+        c.drawBitmap(s.bmp, src, rect, bp);
+        bp.setAlpha(255);
+    }
+
+    /** Sets src to the centred square of a bitmap. */
+    void square(Bitmap b) {
+        int w = b.getWidth(), h = b.getHeight(), side = Math.min(w, h);
+        src.set((w - side) / 2, (h - side) / 2, (w + side) / 2, (h + side) / 2);
+    }
+
+    /** Stand-in cover for songs that have no artwork. */
+    Bitmap placeholder() {
+        if (noArt != null) return noArt;
+        noArt = Bitmap.createBitmap(300, 300, Bitmap.Config.ARGB_8888);
+        Canvas c = new Canvas(noArt);
+        c.drawPaint(shade(vertical(0, 300, new int[]{0xfff0f1f3, 0xffc5c9cf}, null)));
+        fill(0xff9a9fa7);
+        c.save();
+        c.rotate(-20, 122, 205);
+        rect.set(96, 188, 148, 222);
+        c.drawOval(rect, p);
+        c.restore();
+        c.save();
+        c.rotate(-20, 202, 185);
+        rect.set(176, 168, 228, 202);
+        c.drawOval(rect, p);
+        c.restore();
+        c.drawRect(138, 92, 147, 200, p);
+        c.drawRect(218, 72, 227, 180, p);
+        path.rewind();
+        path.moveTo(138, 92);
+        path.lineTo(227, 72);
+        path.lineTo(227, 100);
+        path.lineTo(138, 120);
+        path.close();
+        c.drawPath(path, p);
+        return noArt;
     }
 
     Bitmap decode(Song s) {
+        if (Build.VERSION.SDK_INT >= 29) {
+            try {
+                return act.getContentResolver().loadThumbnail(s.uri(), new Size(600, 600), null);
+            } catch (Exception ignored) {
+            }
+        }
         MediaMetadataRetriever mr = new MediaMetadataRetriever();
         try {
             mr.setDataSource(act, s.uri());
@@ -499,86 +767,160 @@ public class PodView extends View {
         }
     }
 
-    void loadArt(final Song s) {
-        artId = s.id;
-        art = null;
-        new Thread(() -> {
-            final Bitmap result = decode(s);
-            post(() -> { if (artId == s.id) { art = result; invalidate(); } });
-        }).start();
-    }
+    // ---- now playing
 
-    /** Right half of the top menus: a cover from the library, swapped every so often. */
-    void drawMenuArt(Canvas c, float left, float top) {
-        long now = SystemClock.uptimeMillis();
-        if (now > menuArtNext && !all.isEmpty()) {
-            menuArtNext = now + 12000;
-            final List<Song> pool = all;
+    void drawNowPlaying(Canvas c) {
+        c.drawRect(0, 0, 320, 240, fill(0xffffffff));
+        Song s = PlayerService.current();
+        if (s != null && artId != s.id) {                        // keep the old cover up until the new one is ready
+            artId = s.id;
+            final Song want = s;
             new Thread(() -> {
-                for (int i = 0; i < 6; i++) {
-                    final Bitmap bmp = decode(pool.get((int) (Math.random() * pool.size())));
-                    if (bmp != null) { post(() -> { menuArt = bmp; invalidate(); }); return; }
-                }
+                final Bitmap b = decode(want);
+                post(() -> { if (artId == want.id) { art = b; invalidate(); } });
             }).start();
         }
-        tmp.set(left, top, lcd.right, lcd.bottom);
-        if (menuArt != null) {
-            float bw = menuArt.getWidth(), bh = menuArt.getHeight();
-            float cw = Math.min(bw, bh * tmp.width() / tmp.height()), ch = cw * tmp.height() / tmp.width();
-            src.set((int) ((bw - cw) / 2), (int) ((bh - ch) / 2), (int) ((bw + cw) / 2), (int) ((bh + ch) / 2));
-            c.drawBitmap(menuArt, src, tmp, p);
-        } else {
-            p.setShader(grad(top, lcd.bottom, 0xffdfe2e6, 0xffaeb3ba));
-            c.drawRect(tmp, p);
-            p.setShader(null);
+        drawCover(c, art != null ? art : placeholder());
+        header(c, 320, NOW_PLAYING, 9);
+        if (s == null) return;
+        if (PlayerService.shuffled) shuffleIcon(c);
+        if (PlayerService.repeat != 0) repeatIcon(c, PlayerService.repeat == 1);
+
+        text(c, s.title, 160, 71, 154, 16, 0xff000000, bold, Paint.Align.LEFT);
+        text(c, s.artist, 160, 90, 154, 14, 0xff333333, regular, Paint.Align.LEFT);
+        text(c, s.album, 160, 108, 154, 14, 0xff333333, regular, Paint.Align.LEFT);
+        text(c, (PlayerService.index + 1) + " of " + PlayerService.queue.size(), 160, 144, 154, 14,
+                0xff262626, regular, Paint.Align.LEFT);
+
+        long now = SystemClock.uptimeMillis();
+        if (scrub && now >= scrubUntil) scrub = false;
+        boolean vol = !scrub && now < volUntil;
+        int dur = PlayerService.duration(), pos = Math.min(PlayerService.position(), dur);
+        float frac = vol ? am.getStreamVolume(AudioManager.STREAM_MUSIC) / (float) am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                : dur > 0 ? pos / (float) dur : 0;
+        float x0 = 58, x1 = 262, fx = x0 + (x1 - x0) * Math.max(0f, Math.min(1f, frac));
+        c.drawRect(x0, 206, x1, 207, fill(0xffe1e1e1));
+        c.drawRect(x0, 207, x1, 219, shade(TRACK));
+        c.drawRect(x0, 219, x1, 220, fill(0xffc5c5c5));
+        if (fx > x0 + 0.5f) {
+            c.drawRect(x0, 206, fx, 207, fill(0xff7e97d7));
+            c.drawRect(x0, 207, fx, 219, shade(PROGRESS));
+            c.drawRect(x0, 219, fx, 220, fill(0xff5c9ed0));
+            c.drawRect(x0, 206, x0 + 1, 220, fill(0xff6796e4));
+            c.drawRect(x0, 220, fx, 229, shade(PROGRESS_GLOW));
         }
-        // the menu casts a soft shadow onto the picture
-        p.setShader(new LinearGradient(left, 0, left + tmp.width() * 0.08f, 0, 0x55000000, 0, Shader.TileMode.CLAMP));
-        c.drawRect(tmp, p);
-        p.setShader(null);
+        if (vol) {
+            speaker(c, 36, false);
+            speaker(c, 275, true);
+        } else {
+            text(c, time(pos), 47.5f, 219, 50, 13, 0xff000000, bold, Paint.Align.RIGHT);
+            text(c, "-" + time(dur - pos), 273.5f, 219, 50, 13, 0xff000000, bold, Paint.Align.LEFT);
+        }
+        if (scrub) {                                             // diamond playhead
+            path.rewind();
+            path.moveTo(fx, 202.5f);
+            path.lineTo(fx + 7, 213);
+            path.lineTo(fx, 223.5f);
+            path.lineTo(fx - 7, 213);
+            path.close();
+            c.drawPath(path, shade(vertical(202.5f, 223.5f, new int[]{0xff8e9299, 0xff3b3e44}, null)));
+            fill(0xffffffff).setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(1.2f);
+            p.setStrokeJoin(Paint.Join.MITER);
+            c.drawPath(path, p);
+        }
     }
 
-    void drawWheel(Canvas c) {
-        // soft drop shadow, then the wheel face
-        p.setColor(0x22000000);
-        c.drawCircle(cx, cy + R * 0.015f, R * 1.012f, p);
-        p.setShader(grad(cy - R, cy + R, 0xffffffff, 0xffecedef));
-        c.drawCircle(cx, cy, R, p);
-        p.setShader(null);
-
-        int ink = 0xffaeb1b7;
-        text(c, "MENU", cx, cy - R * 0.72f, R, R * 0.15f, ink, true, Paint.Align.CENTER);
-        p.setColor(ink);
-        float s = R * 0.075f;
-        skip(c, cx + R * 0.74f, cy, s, 1);
-        skip(c, cx - R * 0.74f, cy, s, -1);
-        // play / pause glyph
-        float px = cx - s * 1.5f, py = cy + R * 0.76f;
-        tri(c, px, py, s, 1);
-        c.drawRect(px + s * 1.5f, py - s, px + s * 2.0f, py + s, p);
-        c.drawRect(px + s * 2.5f, py - s, px + s * 3.0f, py + s, p);
-
-        // centre button
-        p.setColor(0x30000000);
-        c.drawCircle(cx, cy, r * 1.02f, p);
-        p.setShader(onCenter ? grad(cy - r, cy + r, 0xffb9bbc0, 0xffd6d8dc)
-                : grad(cy - r, cy + r, 0xffeceef0, 0xffc6c8cd));
-        c.drawCircle(cx, cy, r, p);
-        p.setShader(null);
+    /** The cover stands at an angle, as on the real screen, with its mirror image fading below. */
+    void drawCover(Canvas c, Bitmap b) {
+        square(b);
+        float[] unit = {0, 0, 1, 0, 1, 1, 0, 1};
+        rect.set(0, 0, 1, 1);
+        matrix.setPolyToPoly(unit, 0, new float[]{10, 34.5f, 144.5f, 44.3f, 144.5f, 160.4f, 10, 168.9f}, 0, 4);
+        c.save();
+        c.concat(matrix);
+        c.drawBitmap(b, src, rect, bp);
+        c.restore();
+        // mirrored copy hinged on the bottom edge
+        matrix.setPolyToPoly(unit, 0, new float[]{10, 303.3f, 144.5f, 276.5f, 144.5f, 160.4f, 10, 168.9f}, 0, 4);
+        c.save();
+        c.concat(matrix);
+        c.drawBitmap(b, src, rect, bp);
+        c.scale(1, -1, 0, 0.5f);                                 // gradient runs from the hinge outward
+        c.drawRect(-0.01f, 0, 1.01f, 1.01f, shade(REFLECTION));
+        c.restore();
     }
 
-    /** Triangle of half-height s with its flat edge at x, pointing in dir. */
-    void tri(Canvas c, float x, float y, float s, int dir) {
+    static String time(int ms) {
+        int sec = Math.max(0, ms) / 1000;
+        return sec / 60 + ":" + (sec % 60 < 10 ? "0" : "") + sec % 60;
+    }
+
+    Paint line(float width) {
+        fill(0xff1e1e1e).setStyle(Paint.Style.STROKE);
+        p.setStrokeWidth(width);
+        p.setStrokeCap(Paint.Cap.BUTT);
+        p.setStrokeJoin(Paint.Join.ROUND);
+        return p;
+    }
+
+    void arrowHead(Canvas c, float tipX, float y, int dir) {
         path.rewind();
-        path.moveTo(x, y - s); path.lineTo(x + dir * s * 1.2f, y); path.lineTo(x, y + s); path.close();
-        c.drawPath(path, p);
+        path.moveTo(tipX, y);
+        path.lineTo(tipX - dir * 4.2f, y - 3.3f);
+        path.lineTo(tipX - dir * 4.2f, y + 3.3f);
+        path.close();
+        c.drawPath(path, fill(0xff1e1e1e));
     }
 
-    /** Skip glyph: two triangles and a bar, centred on x. */
-    void skip(Canvas c, float x, float y, float s, int dir) {
-        tri(c, x - dir * s * 1.5f, y, s, dir);
-        tri(c, x - dir * s * 0.3f, y, s, dir);
-        float bx = x + dir * s * 0.9f;
-        c.drawRect(Math.min(bx, bx + dir * s * 0.4f), y - s, Math.max(bx, bx + dir * s * 0.4f), y + s, p);
+    void shuffleIcon(Canvas c) {
+        path.rewind();
+        path.moveTo(268, 26.3f);
+        path.lineTo(273.2f, 26.3f);
+        path.lineTo(279.3f, 34);
+        path.lineTo(284, 34);
+        path.moveTo(268, 34);
+        path.lineTo(273.2f, 34);
+        path.lineTo(279.3f, 26.3f);
+        path.lineTo(284, 26.3f);
+        c.drawPath(path, line(2));
+        arrowHead(c, 288, 26.3f, 1);
+        arrowHead(c, 288, 34, 1);
+    }
+
+    void repeatIcon(Canvas c, boolean one) {
+        path.rewind();
+        path.moveTo(294, 30.6f);
+        path.lineTo(294, 29.3f);
+        path.quadTo(294, 26.3f, 297, 26.3f);
+        path.lineTo(305, 26.3f);
+        path.moveTo(311.5f, 29.7f);
+        path.lineTo(311.5f, 31);
+        path.quadTo(311.5f, 34, 308.5f, 34);
+        path.lineTo(300.5f, 34);
+        c.drawPath(path, line(2));
+        arrowHead(c, 309, 26.3f, 1);
+        arrowHead(c, 296.5f, 34, -1);
+        if (one) text(c, "1", 302.8f, 33.2f, 10, 7.5f, 0xff1e1e1e, bold, Paint.Align.CENTER);
+    }
+
+    void speaker(Canvas c, float x, boolean loud) {
+        path.rewind();
+        path.moveTo(x, 210);
+        path.lineTo(x + 3.5f, 210);
+        path.lineTo(x + 8, 206);
+        path.lineTo(x + 8, 220);
+        path.lineTo(x + 3.5f, 216);
+        path.lineTo(x, 216);
+        path.close();
+        c.drawPath(path, fill(0xff3a3a3a));
+        if (!loud) return;
+        line(1.4f).setColor(0xff3a3a3a);
+        p.setStrokeCap(Paint.Cap.ROUND);
+        for (int i = 0; i < 3; i++) {
+            float rr = 3.2f + i * 3;
+            rect.set(x + 8 - rr, 213 - rr, x + 8 + rr, 213 + rr);
+            c.drawArc(rect, -42, 84, false, p);
+        }
     }
 }
