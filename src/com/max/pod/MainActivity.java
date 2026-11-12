@@ -27,6 +27,10 @@ public class MainActivity extends Activity {
         }
         getWindow().setBackgroundDrawable(new ColorDrawable(0xff09090a));
         view = new PodView(this);
+        String forced = getIntent().getStringExtra("finish");   // for screenshots: adb ... -e finish black
+        if ("black".equals(forced)) view.hw.finish = Hardware.BLACK;
+        else if ("red".equals(forced)) view.hw.finish = Hardware.RED;
+        else if ("silver".equals(forced)) view.hw.finish = Hardware.SILVER;
         setContentView(view);
         PlayerService.watcher = view;
         setVolumeControlStream(AudioManager.STREAM_MUSIC);

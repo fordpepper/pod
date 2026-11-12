@@ -124,6 +124,7 @@ public class PodView extends View {
     PodView(MainActivity a) {
         super(a);
         act = a;
+        hw.finish = Hardware.pick(new java.util.Random());
         prefs = a.getSharedPreferences("pod", Context.MODE_PRIVATE);
         vib = (Vibrator) a.getSystemService(Context.VIBRATOR_SERVICE);
         am = (AudioManager) a.getSystemService(Context.AUDIO_SERVICE);
@@ -497,14 +498,16 @@ public class PodView extends View {
         // parts of the wheel dip under the thumb
         if (onCenter) {
             c.drawCircle(hw.cx, hw.cy, hw.r, shade(new RadialGradient(hw.cx, hw.cy, hw.r,
-                    new int[]{0x2e000000, 0x16000000, 0x34000000}, new float[]{0f, 0.8f, 1f}, CLAMP)));
+                    hw.finish.dark ? new int[]{0x22ffffff, 0x10ffffff, 0x24ffffff}
+                            : new int[]{0x2e000000, 0x16000000, 0x34000000}, new float[]{0f, 0.8f, 1f}, CLAMP)));
         } else if (onWheel && !moved && sector >= 0) {
             float[] ox = {0, 1, 0, -1}, oy = {-1, 0, 1, 0};
             float px = hw.cx + ox[sector] * hw.R * 0.72f, py = hw.cy + oy[sector] * hw.R * 0.72f;
             c.save();
             c.clipPath(hw.ring);
             c.drawCircle(px, py, hw.R * 0.75f, shade(new RadialGradient(px, py, hw.R * 0.75f,
-                    new int[]{0x30000000, 0x14000000, 0x00000000}, new float[]{0f, 0.5f, 1f}, CLAMP)));
+                    hw.finish.dark ? new int[]{0x26ffffff, 0x10ffffff, 0x00ffffff}
+                            : new int[]{0x30000000, 0x14000000, 0x00000000}, new float[]{0f, 0.5f, 1f}, CLAMP)));
             c.restore();
         }
 

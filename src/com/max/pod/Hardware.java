@@ -23,7 +23,41 @@ final class Hardware {
     static final float WIN_X = 4.85f, WIN_Y = 4.85f, WIN_W = 52.1f, WIN_H = 39.6f; // glass window
     static final float LCD_W = 49.9f;                                             // lit 4:3 panel
     static final float WHEEL_Y = 72.86f, WHEEL_R = 18.93f, BUTTON_R = 6.82f;
-    static final int LABEL = 0xffa7a9ae;
+
+    /** The colours of one model. Everything else (shape, steel back, glass) is shared. */
+    static final class Finish {
+        final String name;
+        final boolean dark;                 // dark wheel: labels and press hints are light
+        final int[] face, edge, wheel, button, recess;
+        final int label, roll, grain;
+
+        Finish(String name, boolean dark, int[] face, int[] edge, int roll, int[] wheel, int label,
+               int[] button, int[] recess, int grain) {
+            this.name = name; this.dark = dark; this.face = face; this.edge = edge; this.roll = roll;
+            this.wheel = wheel; this.label = label; this.button = button; this.recess = recess; this.grain = grain;
+        }
+    }
+
+    static final Finish SILVER = new Finish("silver", false,
+            new int[]{0xffe6e8eb, 0xffd9dbdf, 0xffc6c8cd}, new int[]{0xd0ffffff, 0x70ffffff, 0x20ffffff, 0x40ffffff},
+            0x42000000, new int[]{0xffffffff, 0xfff4f4f5, 0xffe5e6e8}, 0xffa7a9ae,
+            new int[]{0xffc3c5c9, 0xffd7d9dc, 0xffeaebed}, new int[]{0xff64676c, 0xffb4b7bb, 0xffffffff}, 12);
+    static final Finish BLACK = new Finish("black", true,
+            new int[]{0xff303134, 0xff222326, 0xff141517}, new int[]{0x80ffffff, 0x38ffffff, 0x0cffffff, 0x1cffffff},
+            0x70000000, new int[]{0xff2b2c2f, 0xff1f2023, 0xff151618}, 0xffe9eaec,
+            new int[]{0xff121315, 0xff1c1d20, 0xff2a2b2e}, new int[]{0xff000000, 0xff2a2b2e, 0xff6a6c70}, 9);
+    static final Finish RED = new Finish("red", false,
+            new int[]{0xffdd2a35, 0xffc81d28, 0xffa3121b}, new int[]{0xb0ffffff, 0x58ffffff, 0x14ffffff, 0x30ffffff},
+            0x50000000, new int[]{0xffffffff, 0xfff4f4f5, 0xffe5e6e8}, 0xffa7a9ae,
+            new int[]{0xffa0111a, 0xffbb1923, 0xffd12631}, new int[]{0xff5e0a10, 0xffb8323a, 0xffff9aa0}, 12);
+
+    /** Mostly silver; now and then the black one, or the rare red one. */
+    static Finish pick(Random rnd) {
+        int roll = rnd.nextInt(100);
+        return roll < 10 ? BLACK : roll < 20 ? RED : SILVER;
+    }
+
+    Finish finish = SILVER;
 
     final RectF body = new RectF(), window = new RectF(), lcd = new RectF();
     final Path windowPath = new Path(), ring = new Path();
@@ -63,9 +97,8 @@ final class Hardware {
     }
 
     /** Light comes from the upper left, so a recess is dark there and bright at the lower right. */
-    private static Shader recess(float x0, float y0, float x1, float y1) {
-        return new LinearGradient(x0, y0, x1, y1,
-                new int[]{0xff64676c, 0xffb4b7bb, 0xffffffff}, new float[]{0f, 0.5f, 1f}, CLAMP);
+    private Shader recess(float x0, float y0, float x1, float y1) {
+        return new LinearGradient(x0, y0, x1, y1, finish.recess, new float[]{0f, 0.5f, 1f}, CLAMP);
     }
 
     void render(int w, int h) {
@@ -92,7 +125,7 @@ final class Hardware {
         if (bitmap != null) bitmap.recycle();
         bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
         Canvas c = new Canvas(bitmap);
-        Shader grain = new BitmapShader(noise(), Shader.TileMode.REPEAT, Shader.TileMode.REPEAT);
+        Shader grain = new BitmapShader(noise(finish.grain), Shader.TileMode.REPEAT, Shader.TileMode.REPEAT);
         float rc = CORNER * u;
 
         // backdrop: a dark surface with a pool of light behind the player
@@ -132,17 +165,17 @@ final class Hardware {
         stroke(0.12f * u, 0);
         c.drawPath(face, p);                                   // seam between steel and aluminium
         c.drawPath(face, shade(vertical(t.top, t.bottom,
-                new int[]{0xffe6e8eb, 0xffd9dbdf, 0xffc6c8cd}, new float[]{0f, 0.45f, 1f})));
+                finish.face, new float[]{0f, 0.45f, 1f})));
         c.save();
         c.clipPath(face);
-        fill(0x42000000);
+        fill(finish.roll);
         stroke(2.6f * u, 1.1f * u);
         c.drawPath(face, p);                                   // the face rolls off toward its edge
         path.rewind();
         t.inset(0.55f * u, 0.55f * u);
         path.addRoundRect(t, rf - 0.55f * u, rf - 0.55f * u, Path.Direction.CW);
         shade(vertical(body.top, body.bottom,
-                new int[]{0xd0ffffff, 0x70ffffff, 0x20ffffff, 0x40ffffff}, new float[]{0f, 0.1f, 0.6f, 1f}));
+                finish.edge, new float[]{0f, 0.1f, 0.6f, 1f}));
         stroke(0.4f * u, 0.45f * u);
         c.drawPath(path, p);                                   // light catching that rolled edge
         c.drawPaint(shade(grain));
@@ -159,12 +192,12 @@ final class Hardware {
         // click wheel
         c.drawCircle(cx, cy, R + 0.2f * u, shade(recess(cx - R, cy - R, cx + R, cy + R)));
         c.drawCircle(cx, cy, R, shade(new LinearGradient(cx - R * 0.5f, cy - R, cx + R * 0.5f, cy + R,
-                new int[]{0xffffffff, 0xfff4f4f5, 0xffe5e6e8}, new float[]{0f, 0.5f, 1f}, CLAMP)));
+                finish.wheel, new float[]{0f, 0.5f, 1f}, CLAMP)));
         c.drawCircle(cx, cy, R, shade(new RadialGradient(cx, cy, R,
                 new int[]{0x00000000, 0x00000000, 0x14000000, 0x38000000},
                 new float[]{0f, 0.95f, 0.985f, 1f}, CLAMP)));
 
-        fill(LABEL);
+        fill(finish.label);
         menuLabel(c, cx, cy - 0.815f * R, 0.1015f * R);
         float ih = 0.049f * R;                                 // half the height of the symbols
         skipLabel(c, cx + 0.81f * R, cy, ih, 1);
@@ -174,13 +207,14 @@ final class Hardware {
         // centre button: same aluminium, very slightly dished
         c.drawCircle(cx, cy, r + 0.2f * u, shade(recess(cx - r, cy - r, cx + r, cy + r)));
         c.drawCircle(cx, cy, r, shade(vertical(cy - r, cy + r,
-                new int[]{0xffc3c5c9, 0xffd7d9dc, 0xffeaebed}, new float[]{0f, 0.55f, 1f})));
+                finish.button, new float[]{0f, 0.55f, 1f})));
         c.save();
         path.rewind();
         path.addCircle(cx, cy, r, Path.Direction.CW);
         c.clipPath(path);
         shade(vertical(cy - r, cy + r,
-                new int[]{0x58000000, 0x00000000, 0x00ffffff, 0xc0ffffff}, new float[]{0f, 0.45f, 0.55f, 1f}));
+                new int[]{0x58000000, 0x00000000, 0x00ffffff, finish.dark ? 0x40ffffff : 0xc0ffffff},
+                new float[]{0f, 0.45f, 0.55f, 1f}));
         stroke(1.0f * u, 0.5f * u);
         c.drawCircle(cx, cy, r, p);
         c.drawPaint(shade(grain));
@@ -188,12 +222,12 @@ final class Hardware {
     }
 
     /** Fine random speckle that gives the metal its bead-blasted look. */
-    private static Bitmap noise() {
+    private static Bitmap noise(int strength) {
         int n = 160;
         int[] px = new int[n * n];
         Random rnd = new Random(11);
         for (int i = 0; i < px.length; i++)
-            px[i] = (rnd.nextInt(12) << 24) | (rnd.nextBoolean() ? 0xffffff : 0x000000);
+            px[i] = (rnd.nextInt(strength) << 24) | (rnd.nextBoolean() ? 0xffffff : 0x000000);
         return Bitmap.createBitmap(px, n, n, Bitmap.Config.ARGB_8888);
     }
 
