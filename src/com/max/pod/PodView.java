@@ -14,6 +14,7 @@ import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Shader;
 import android.graphics.Typeface;
+import android.graphics.drawable.BitmapDrawable;
 import android.media.AudioAttributes;
 import android.media.AudioManager;
 import android.media.MediaMetadataRetriever;
@@ -149,8 +150,8 @@ public class PodView extends View {
     // ------------------------------------------------------------------ menus
 
     /** songs == null means we have no permission to read the library yet. */
-    void setSongs(List<Song> songs) {
-        boolean locked = cur().type == MSG;
+    void setSongs(List<Song> songs, boolean reset) {
+        boolean locked = reset || cur().type == MSG;
         if (songs == null) {
             stack.clear();
             stack.add(new Screen(MSG, "iPod", "Allow Access"));
@@ -159,6 +160,8 @@ public class PodView extends View {
             if (locked || stack.isEmpty() || cur().items.isEmpty()) {
                 stack.clear();
                 stack.add(new Screen(MAIN, "iPod", "Music", "Settings", "Shuffle Songs"));
+                leaving = null;
+                slideNext = 0;
             }
         }
         invalidate();
@@ -203,7 +206,7 @@ public class PodView extends View {
                 break;
             case MAIN:
                 if (item.equals("Music")) push(new Screen(MUSIC, "Music", "Artists", "Albums", "Songs"));
-                else if (item.equals("Settings")) push(new Screen(SETTINGS, "Settings", "Shuffle", "Repeat", "Clicker"));
+                else if (item.equals("Settings")) push(new Screen(SETTINGS, "Settings", "Shuffle", "Repeat", "Clicker", "Music Folder"));
                 else if (item.equals(NOW_PLAYING)) { if (PlayerService.current() != null) nowPlaying(); }
                 else if (!all.isEmpty()) {                       // Shuffle Songs
                     PlayerService.play(act, all, 0, true);
@@ -220,6 +223,7 @@ public class PodView extends View {
                 push(g);
                 break;
             case SETTINGS:
+                if (s.sel == 3) { act.startActivity(new android.content.Intent(act, SettingsActivity.class)); break; }
                 if (s.sel == 0) PlayerService.shuffle = !PlayerService.shuffle;
                 else if (s.sel == 1) PlayerService.repeat = (PlayerService.repeat + 1) % 3;
                 else clicker = !clicker;
@@ -259,7 +263,7 @@ public class PodView extends View {
     String settingValue(int i) {
         if (i == 0) return PlayerService.shuffle ? "Songs" : "Off";
         if (i == 1) return PlayerService.repeat == 0 ? "Off" : PlayerService.repeat == 1 ? "One" : "All";
-        return clicker ? "On" : "Off";
+        return i == 2 ? (clicker ? "On" : "Off") : null;
     }
 
     void playPause() {
@@ -476,13 +480,18 @@ public class PodView extends View {
     // ------------------------------------------------------------------ drawing
 
     @Override protected void onSizeChanged(int w, int h, int ow, int oh) {
-        if (w > 0 && h > 0) hw.render(w, h);
+        if (w <= 0 || h <= 0) return;
+        Bitmap old = hw.bitmap;
+        hw.render(w, h);
+        // As the view's background the body sits in its own cached render node, so redrawing the
+        // screen 15 times a second doesn't re-record or re-upload it.
+        setBackground(new BitmapDrawable(getResources(), hw.bitmap));
+        if (old != null && old != hw.bitmap) old.recycle();
     }
 
     @Override protected void onDraw(Canvas c) {
         if (hw.bitmap == null) return;
         long now = SystemClock.uptimeMillis();
-        c.drawBitmap(hw.bitmap, 0, 0, null);
 
         // the lit screen, in iPod pixels
         c.save();
@@ -514,8 +523,10 @@ public class PodView extends View {
         // keep animating only while something on screen is moving
         Screen s = cur();
         removeCallbacks(ticker);
-        long wait = sliding ? 0 : s.split() ? 40
-                : s.type == NOW && (PlayerService.playing || now < Math.max(volUntil, scrubUntil)) ? 200 : 30000;
+        long wait = sliding ? 0 : s.split() ? 100                   // drifting artwork: moves < 1 px a frame at 10 fps
+                : s.type == NOW && now < Math.max(volUntil, scrubUntil) ? 100
+                : s.type == NOW && PlayerService.playing ? 1005 - PlayerService.position() % 1000  // next second
+                : 30000;
         if (wait == 0) postInvalidateOnAnimation(); else postDelayed(ticker, wait);
     }
 

@@ -993,7 +993,10 @@
     if (!hw) return;
     const s = cur();
     const animating = !!leaving;
-    const every = animating ? 0 : s.split() ? 40 : s.type === NOW && (P.playing || t < Math.max(volUntil, scrubUntil)) ? 200 : Infinity;
+    const every = animating ? 0 : s.split() ? 100                    // drifting artwork: moves < 1 px a frame at 10 fps
+      : s.type === NOW && t < Math.max(volUntil, scrubUntil) ? 100
+      : s.type === NOW && P.playing ? 1005 - position() % 1000              // when the clock ticks over
+      : Infinity;
     if (!dirty && t - lastFrame < every) return;
     dirty = false;
     lastFrame = t;

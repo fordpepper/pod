@@ -21,6 +21,8 @@ A click-wheel music player that looks like the iPod classic: an Android app that
 
 - Lists every song in the phone's media library: Music > Artists / Albums / Songs, Shuffle Songs, Now Playing.
 - Keeps playing in the background and with the screen locked. Android sees what's playing: lock screen, notification and quick-settings controls, headset/Bluetooth buttons. Unplugging headphones pauses, and calls pause and then resume.
+- **Music folder:** by default Pod lists all music on the phone. To limit it to one folder (e.g. Internal shared storage/Music), open the phone's Settings > Apps > Pod > *Additional settings in the app*, or Pod's own Settings > Music Folder, and choose the folder. Subfolders are included.
+- Light on resources: about 90 KB to download, and when idle it redraws only the screen area, about 10 times a second on the menus (the drifting artwork) and once a second in Now Playing.
 - Needs Android 8.0+. Install `pod.apk` from the releases page (allow installing from unknown sources), or `adb install -r pod.apk`.
 - Build: `./build.sh` (needs the Android SDK at `~/android-sdk` with build-tools 34.0.0 and platform android-34, plus a debug keystore). No Gradle.
 
@@ -34,5 +36,5 @@ A click-wheel music player that looks like the iPod classic: an Android app that
 ## Notes
 
 - The body is drawn from the real dimensions in millimetres (`Hardware.java`); the screen is drawn in the original 320×240 grid (`PodView.java`).
-- Fonts: TeX Gyre Heros (GUST Font License, see `assets/FONT-LICENSE.txt`).
+- Fonts: TeX Gyre Heros, trimmed to Latin characters (GUST Font License, see `assets/FONT-LICENSE.txt`). Other scripts use the phone's own font.
 - Unofficial fan project, not affiliated with or endorsed by Apple. Song previews and artwork courtesy of Apple Music.

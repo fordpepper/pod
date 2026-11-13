@@ -219,6 +219,13 @@ final class Hardware {
         c.drawCircle(cx, cy, r, p);
         c.drawPaint(shade(grain));
         c.restore();
+
+        // keep it in GPU memory only: no 10 MB copy on the Java heap
+        Bitmap gpu = bitmap.copy(Bitmap.Config.HARDWARE, false);
+        if (gpu != null) {
+            bitmap.recycle();
+            bitmap = gpu;
+        }
     }
 
     /** Fine random speckle that gives the metal its bead-blasted look. */

@@ -17,6 +17,7 @@ import java.util.List;
 
 public class MainActivity extends Activity {
     PodView view;
+    String loadedFor;                    // which music folder the list on screen came from
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -34,7 +35,12 @@ public class MainActivity extends Activity {
         setContentView(view);
         PlayerService.watcher = view;
         setVolumeControlStream(AudioManager.STREAM_MUSIC);
-        if (granted()) load(); else { view.setSongs(null); ask(); }
+        if (granted()) load(); else { view.setSongs(null, false); ask(); }
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        if (loadedFor != null && !loadedFor.equals(Folder.key(this)) && granted()) load();
     }
 
     String perm() {
@@ -56,14 +62,26 @@ public class MainActivity extends Activity {
         if (granted()) load();
     }
 
+    /** Reads the library on a background thread so a big collection never stalls the screen. */
     void load() {
+        final boolean reset = loadedFor != null;
+        final String key = Folder.key(this);
+        loadedFor = key;
+        new Thread(() -> {
+            final List<Song> songs = query();
+            runOnUiThread(() -> { if (key.equals(loadedFor)) view.setSongs(songs, reset); });
+        }).start();
+    }
+
+    List<Song> query() {
         List<Song> songs = new ArrayList<>();
         String[] cols = {MediaStore.Audio.Media._ID, MediaStore.Audio.Media.TITLE,
                 MediaStore.Audio.Media.ARTIST, MediaStore.Audio.Media.ALBUM, MediaStore.Audio.Media.DURATION,
                 MediaStore.Audio.Media.TRACK};
+        List<String> args = new ArrayList<>();
+        String where = MediaStore.Audio.Media.IS_MUSIC + "!=0" + Folder.where(this, args);
         try (Cursor c = getContentResolver().query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, cols,
-                MediaStore.Audio.Media.IS_MUSIC + "!=0", null,
-                MediaStore.Audio.Media.TITLE + " COLLATE NOCASE")) {
+                where, args.toArray(new String[0]), MediaStore.Audio.Media.TITLE + " COLLATE NOCASE")) {
             while (c != null && c.moveToNext()) {
                 Song s = new Song();
                 s.id = c.getLong(0);
@@ -76,7 +94,7 @@ public class MainActivity extends Activity {
             }
         } catch (Exception ignored) {
         }
-        view.setSongs(songs);
+        return songs;
     }
 
     static String clean(String s, String fallback) {
